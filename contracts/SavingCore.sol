@@ -12,7 +12,7 @@ contract SavingCore is ERC721, Ownable, Pausable {
         uint256 aprBps; // lãi suất hàng năm tính bằng basis points (1% = 100 bps)
         uint256 minDeposit; // số tiền gửi tối thiểu
         uint256 maxDeposit; // số tiền gửi tối đa
-        uint256 penDps; // phí phạt khi rút tiền sớm, tính bằng basis points
+        uint256 penBps; // phí phạt khi rút tiền sớm, tính bằng basis points
         bool enabled; // admin có thể bật/tắt kế hoạch gửi này
 
     }
@@ -20,8 +20,8 @@ contract SavingCore is ERC721, Ownable, Pausable {
     enum DepositStatus {
         Active, 
         Withdrawn,
-        ManualRenewal, // gia han thủ công
-        AutoRenawal // gia han tự động
+        ManualRenewed, // gia han thủ công
+        AutoRenewed // gia han tự động
     }
     /// @notice chung chi gửi tiền 
     struct DepositInfo {
@@ -30,12 +30,15 @@ contract SavingCore is ERC721, Ownable, Pausable {
         uint256 startAt; // thời gian bắt đầu gửi
         uint256 endAt; // thoi diem dao han
         uint256 aprBpsAtOpen; // lãi suất tại thời điểm mở deposit
+        uint256 penBpsAtOpen;
         DepositStatus status; // trang thai hien tai cua deposit
 
 
     }
+    IERC20 public immutable token;
+    VaultManager public immutable vault;
 
-    mapping(uint256 => SavingPlan) public plan;
+    mapping(uint256 => SavingPlan) public plans;
     uint256 public nextPlanId;
 
     mapping(uint256 => DepositInfo) public deposits;
@@ -50,7 +53,7 @@ contract SavingCore is ERC721, Ownable, Pausable {
     event DepositOpened (
 
         uint256 indexed depositId,
-        uint256 indexed owner,
+        address indexed owner,
         uint256 planId,
         uint256 principal,
         uint256 startAt,
@@ -59,13 +62,13 @@ contract SavingCore is ERC721, Ownable, Pausable {
     );
     event Withdrawn (
         uint256 indexed depositId,
-        uint256 indexed owner,
+        address indexed owner,
         uint256 principal,
         uint256 interest,
-        uint256 isEarly
+        bool isEarly
     );
 
-    event renewed (
+    event Renewed(
         uint256 indexed oldDepositId,
         uint256 indexed newDepositId,
         uint256 newPrincipal,
@@ -77,7 +80,7 @@ contract SavingCore is ERC721, Ownable, Pausable {
 
     error PlanNotFound(); // bao lỗi khi planId không tồn tại
     error PlanDisabled(); // bao lỗi khi plan bị tắt
-    error BelowMitnDeposit(); // bao lỗi khi số tiền gửi nhỏ hơn mức tối thiểu
+    error BelowMinDeposit(); // bao lỗi khi số tiền gửi nhỏ hơn mức tối thiểu
     error AboveMaxDeposit(); // bao lỗi khi số tiền gửi lớn hơn mức tối đa
     error NotDepositOwner(); // bao lỗi khi người gọi không phải chủ sở hữu của deposit
     error DepositNotActive(); // bao lỗi khi deposit không ở trạng thái Active
@@ -101,13 +104,15 @@ contract SavingCore is ERC721, Ownable, Pausable {
         
     }
 
+    // admin: Plan Management
+
     /// @notice tao saving plan mới
     function createPlan(
         uint256 tenorDays,
         uint256 aprBps,
         uint256 minDeposit,
         uint256 maxDeposit,
-        uint256 penDps
+        uint256 penBps
     ) external onlyOwner {
         // xac thuc
         if (tenorDays == 0) revert ZeroAmount();
@@ -119,7 +124,7 @@ contract SavingCore is ERC721, Ownable, Pausable {
             aprBps: aprBps,
             minDeposit: minDeposit,
             maxDeposit: maxDeposit,
-            penDps: penDps,
+            penBps: penBps,
             enabled: true
         });
         emit PlanCreated(planId, tenorDays, aprBps);
@@ -158,7 +163,7 @@ contract SavingCore is ERC721, Ownable, Pausable {
         uint256 amount
 
     ) external whenNotPaused {
-        SavingPlan memory  plan = plans[planId];
+        SavingPlan memory  plan  = plans[planId];
         
         // kiem tra plan hợp lệ
         if (!plan.enabled) revert PlanDisabled();
@@ -173,7 +178,7 @@ contract SavingCore is ERC721, Ownable, Pausable {
 
         // tinh thoi gian dao han
 
-        uint256 startAt = block.timestamp + plan.tenorDays * 1 days;
+        uint256 endAt = block.timestamp + plan.tenorDays * 1 days;
 
         // MintNFT vooi depositId la tokenID
         uint256 depositId = nextDepositId++;
@@ -183,10 +188,10 @@ contract SavingCore is ERC721, Ownable, Pausable {
         deposits[depositId] = DepositInfo({
             planId: planId,
             principal: amount,
-            StartAt: block.timestamp,
-            stratAt: startAt,
+            startAt: block.timestamp,
+            endAt: endAt,
             aprBpsAtOpen: plan.aprBps,
-            penSpsAtOpen: plan.penDps,
+            penBpsAtOpen: plan.penBps,
             status: DepositStatus.Active
 
         });
@@ -197,11 +202,13 @@ contract SavingCore is ERC721, Ownable, Pausable {
             planId,
             amount,
             block.timestamp,
-            startAt,
+            endAt,
             plan.aprBps
         );
 
     }
+
+    // Internal
 
     /// @dev nhan truoc chia sau de tranh mat precision khi tinh toan tien lai
 
@@ -234,7 +241,111 @@ contract SavingCore is ERC721, Ownable, Pausable {
             dep.aprBpsAtOpen,
             tenorSeconds
         );
+        // cap nhat status truoc khi chuyen tien
+        
+        dep.status = DepositStatus.Withdrawn;
 
+        // tra goc tu contract nay
+        token.transfer(msg.sender, dep.principal);
+
+        // tra lai tu vault
+        vault.payInterest(msg.sender, interest);
+        emit Withdrawn(
+            depositId,
+            msg.sender,
+            dep.principal,
+            interest,
+            false
+        );
+    }
+        function earlyWithdraw(uint256 depositId) external whenNotPaused {
+            if(ownerOf(depositId)!= msg.sender) revert NotDepositOwner();
+
+            DepositInfo storage dep = deposits[depositId];
+            if (dep.status != DepositStatus.Active) revert DepositNotActive();
+            if (block.timestamp >= dep.endAt) revert AlreadyEndAt();
+
+            // tinh phat
+            uint256 penalty = (dep.principal*dep.penBpsAtOpen) / 10_000;
+            uint256 userReceivers = dep.principal - penalty;
+            
+
+            dep.status = DepositStatus.Withdrawn;
+
+            // tra user phan con lai 
+            token.transfer(msg.sender, userReceivers);
+
+            //  gui phi ve feeReceiver qua vault
+            token.transfer(address(vault), penalty);
+            vault.collectFee(penalty);
+            emit Withdrawn(
+                depositId,
+                msg.sender,
+                dep.principal,
+                0,
+                true
+            );
+
+        }
+
+        // userL Renew
+        ///@notice Gia han thu cong sau khi dao han
+
+        function renewDeposit(
+            uint256 depositId,
+            uint256 newPlanId
+
+        ) external whenNotPaused {
+            if(ownerOf(depositId) != msg.sender) revert NotDepositOwner();
+
+            DepositInfo storage dep = deposits[depositId];
+            if (dep.status != DepositStatus.Active) revert DepositNotActive();
+            if (block.timestamp < dep.endAt) revert NotEndAt();
+
+            SavingPlan memory newPlan = plans[newPlanId];
+            if (!newPlan.enabled) revert PlanDisabled();
+
+            // tinh  lai deposit cu - cong vao goc moi
+            uint256 tenorSeconds = dep.endAt - dep.startAt;
+            uint256 interest = _calculateInterest(
+                dep.principal,
+                dep.aprBpsAtOpen,
+                tenorSeconds
+            );
+            // lai tra tu vault cong vao goc moi
+            uint256 newPrincipal = dep.principal + interest;
+            vault.payInterest(address(this), interest);
+
+            // danh dau deposit cu
+            dep.status = DepositStatus.ManualRenewed;
+
+            // mint deposit moi
+        uint256 newDepositId = nextDepositId++;
+        address depositOwner = ownerOf(depositId);
+        _mint(depositOwner, newDepositId);
+
+        deposits[newDepositId] = DepositInfo({
+            planId: dep.planId,
+            principal: newPrincipal,
+            startAt: block.timestamp,
+            endAt: block.timestamp + (tenorSeconds),
+            aprBpsAtOpen: dep.aprBpsAtOpen,
+            penBpsAtOpen: dep.penBpsAtOpen,
+            status: DepositStatus.Active
+        });
+        emit Renewed(depositId, newDepositId, newPrincipal, dep.planId);
+
+    }
+
+    ///@notice xem thong tin deposit
+    function getDepositInfo(uint256 depositId) external view returns( DepositInfo memory){
+        return deposits[depositId];
+
+    }
+
+    ///@notice Xem thong tin plan
+    function getPlan(uint256 planId) external view returns (SavingPlan memory){
+        return plans[planId];
     }
 
 
